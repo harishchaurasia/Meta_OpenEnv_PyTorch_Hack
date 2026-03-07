@@ -1,0 +1,4 @@
+numpy
+openenv-core[core]>=0.2.1
+uvicorn[standard]
+fastapi

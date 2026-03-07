@@ -1,0 +1,25 @@
+# OpenEnv configuration for the Adaptive Navigation Environment
+# Used by `openenv validate`, `openenv build`, and `openenv push`.
+
+name: adaptive_nav
+version: "0.1.0"
+description: >
+  Partially observable 2D grid-world for evaluating LLM/RL agents on
+  long-horizon planning, key-door-goal mechanics, and dynamic replanning.
+
+# Entry points
+server:
+  module: adaptive_nav.server.app
+  app: app
+  dockerfile: adaptive_nav/server/Dockerfile
+
+# Pydantic model locations
+models:
+  action: adaptive_nav.models.NavAction
+  observation: adaptive_nav.models.NavObservation
+  state: adaptive_nav.models.NavState
+
+# Client
+client:
+  module: adaptive_nav.openenv_client
+  class: NavEnvClient

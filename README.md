@@ -2,7 +2,7 @@
 
 A partially observable 2D grid-world environment designed for training and evaluating LLM / RL agents on **long-horizon planning** and **world modeling**.
 
-Built for the Meta OpenEnv PyTorch Hackathon.
+Built for the **Meta OpenEnv PyTorch Hackathon** -- fully compatible with [OpenEnv 0.2.1](https://github.com/meta-pytorch/OpenEnv).
 
 ---
 
@@ -11,7 +11,7 @@ Built for the Meta OpenEnv PyTorch Hackathon.
 Real-world navigation requires agents to:
 
 1. **Explore** an unknown environment under partial observability.
-2. **Plan** multi-step sequences (find key → unlock door → reach goal).
+2. **Plan** multi-step sequences (find key -> unlock door -> reach goal).
 3. **Adapt** when the world changes mid-episode (corridors open/close).
 4. **Manage resources** (limited energy budget).
 
@@ -54,15 +54,16 @@ By default the agent receives a **partial observation**:
 
 ```python
 {
-    "local_view": np.ndarray,   # (2*r+1, 2*r+1) character grid centred on agent
-    "energy": int,              # remaining energy
-    "has_key": bool,            # whether the key has been collected
-    "door_unlocked": bool,      # whether the door has been opened
-    "step_count": int,          # steps taken so far
+    "local_view": list[list[str]],  # (2*r+1, 2*r+1) character grid centred on agent
+    "energy": int,                  # remaining energy
+    "has_key": bool,                # whether the key has been collected
+    "door_unlocked": bool,          # whether the door has been opened
+    "step_count": int,              # steps taken so far
+    "mission": {"get_key": bool, "unlock_door": bool, "reach_goal": bool},
 }
 ```
 
-Pass `full=True` to `get_observation()` to also receive the entire grid (useful for debugging / oracle baselines).
+Pass `full=True` to `get_observation()` or enable `debug=True` to also receive the full grid and path hints.
 
 ---
 
@@ -74,10 +75,10 @@ Pass `full=True` to `get_observation()` to also receive the entire grid (useful 
 | Pick up key | +20 |
 | Unlock door | +30 |
 | Each step | -1 |
-| Bump into wall | -3 |
-| Useless interact | -5 |
+| Bump into wall | -2 |
+| Useless interact | -2 |
 | Hit hazard | -20 |
-| Completion bonus | +remaining_energy × 0.5 + (max_energy − steps) × 0.3 |
+| Completion bonus | +remaining_energy x 0.5 + (max_energy - steps) x 0.3 |
 
 All values are defined in `REWARD_CONFIG` at the top of `adaptive_nav/env.py` for easy tuning.
 
@@ -93,32 +94,91 @@ When `dynamic_changes=True` (default), the environment mutates the grid at a con
 
 ---
 
-## Quick Start
-
-### Install dependencies
+## Quick Start (Local)
 
 ```bash
 pip install -r requirements.txt
-```
 
-### Run the CLI demo
-
-```bash
 # Random-action episode
 python demo.py
 
 # Manual play (WASD + E to interact + Q to wait)
 python demo.py --manual
 
-# Reproducible seed
-python demo.py --seed 42
-```
+# Easy 7x7 map with debug path hints
+python demo.py --easy --debug
 
-### Run the Streamlit app
-
-```bash
+# Streamlit interactive app
 streamlit run app.py
 ```
+
+---
+
+## OpenEnv Deployment
+
+This project is structured as an [OpenEnv](https://meta-pytorch.org/OpenEnv/) environment and can be served as an HTTP/WebSocket service or deployed to Hugging Face Spaces.
+
+### Install OpenEnv deps
+
+```bash
+pip install "openenv-core[core]>=0.2.1" uvicorn fastapi
+```
+
+### Run the OpenEnv server locally
+
+```bash
+uvicorn adaptive_nav.server.app:app --host 0.0.0.0 --port 8000
+```
+
+### Connect with the client
+
+```python
+from adaptive_nav.openenv_client import NavEnvClient
+from adaptive_nav.models import NavAction
+
+client = NavEnvClient(base_url="http://localhost:8000")
+
+with client:
+    result = client.reset()
+    print(result.observation.local_view)
+
+    result = client.step(NavAction(action_id=0))   # move up
+    print(result.observation.energy, result.reward)
+```
+
+### Build Docker image
+
+```bash
+docker build -f adaptive_nav/server/Dockerfile -t adaptive-nav:latest .
+docker run -p 8000:8000 adaptive-nav:latest
+```
+
+### Deploy to Hugging Face Spaces
+
+```bash
+openenv validate
+openenv push --repo-id YOUR_USERNAME/adaptive-nav
+```
+
+---
+
+## TRL Training Skeleton
+
+A minimal training script using Hugging Face TRL's `GRPOTrainer` is provided at `train_skeleton.py`. It demonstrates:
+
+1. Connecting to the OpenEnv server as a reward source.
+2. Custom `rollout_func` that generates completions and steps through the env.
+3. Extracting environment rewards via `kwargs` in the reward function.
+
+```bash
+# Terminal 1: Start the environment server
+uvicorn adaptive_nav.server.app:app --host 0.0.0.0 --port 8001
+
+# Terminal 2: Run training (requires GPU + pip install trl transformers datasets accelerate)
+python train_skeleton.py --env-url http://localhost:8001
+```
+
+This skeleton is **not** expected to converge -- it shows the wiring so you can iterate on prompting, multi-turn interaction, and reward shaping.
 
 ---
 
@@ -126,19 +186,51 @@ streamlit run app.py
 
 ```
 adaptive_nav/
-    __init__.py        # Package exports
-    env.py             # AdaptiveNavEnv class + reward config
-    generator.py       # Maze generation + dynamic changes
-    renderer.py        # Text and RGB renderers
-app.py                 # Streamlit interactive demo
-demo.py                # CLI demo script
-requirements.txt
+    __init__.py              # Package exports (local + OpenEnv)
+    env.py                   # AdaptiveNavEnv -- local environment class
+    generator.py             # Maze generation + dynamic changes
+    renderer.py              # Text and RGB renderers
+    models.py                # Pydantic Action/Observation/State (OpenEnv wire format)
+    openenv_client.py        # EnvClient for remote access
+    server/
+        __init__.py
+        nav_environment.py   # OpenEnv Environment wrapper around AdaptiveNavEnv
+        app.py               # FastAPI app (openenv create_app)
+        requirements.txt     # Server-specific deps
+        Dockerfile           # For Docker / HF Spaces deployment
+openenv.yaml                 # OpenEnv CLI config
+app.py                       # Streamlit interactive demo (local)
+demo.py                      # CLI demo script (local)
+train_skeleton.py            # Minimal TRL training example
+requirements.txt             # Core + local demo deps
 README.md
+```
+
+### Architecture
+
+```
++------------------+       +------------------------+
+|  Local path      |       |  OpenEnv path          |
+|  (demo.py,       |       |  (server/app.py,       |
+|   app.py)        |       |   Docker, HF Spaces)   |
++--------+---------+       +----------+-------------+
+         |                             |
+         v                             v
+   AdaptiveNavEnv              NavEnvironment
+   (env.py)                    (wraps AdaptiveNavEnv)
+         |                             |
+         v                             v
+   generator.py +              NavAction / NavObservation
+   renderer.py                 (models.py -- Pydantic)
+                                       |
+                                       v
+                               NavEnvClient
+                               (openenv_client.py)
 ```
 
 ---
 
-## Environment API
+## Environment API (Local)
 
 ```python
 from adaptive_nav import AdaptiveNavEnv
@@ -156,9 +248,12 @@ img  = env.render(mode="rgb_array")            # numpy RGB image
 ## Tech Stack
 
 - **Python 3.10+**
-- **NumPy** – grid representation and rendering
-- **Matplotlib** – optional visualisation
-- **Streamlit** – interactive web demo
+- **NumPy** -- grid representation and rendering
+- **Pydantic** -- OpenEnv wire format
+- **OpenEnv 0.2.1** -- environment server framework
+- **FastAPI + Uvicorn** -- HTTP/WebSocket server
+- **Streamlit** -- local interactive web demo
+- **TRL** -- training skeleton (optional)
 
 ---
 
