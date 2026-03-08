@@ -99,6 +99,46 @@ except Exception as exc:
 
 
 # ---------------------------------------------------------------------------
+# REST endpoints for reset / step — work alongside the OpenEnv WebSocket
+# and give clients a simple alternative that doesn't depend on long-lived
+# WebSocket sessions (HF Spaces tends to close idle sockets quickly).
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel as _BM
+from typing import Optional as _Opt
+
+class _ResetReq(_BM):
+    seed: _Opt[int] = None
+
+class _StepReq(_BM):
+    action_id: int
+
+_rest_env: _Opt["NavEnvironment"] = None  # lazy — created on first request
+
+def _get_env():
+    global _rest_env
+    if _rest_env is None:
+        from adaptive_nav.server.nav_environment import NavEnvironment as _NE
+        _rest_env = _NE()
+    return _rest_env
+
+
+@app.post("/api/reset")
+def api_reset(req: _ResetReq):
+    env = _get_env()
+    obs = env.reset(seed=req.seed)
+    return obs.model_dump()
+
+
+@app.post("/api/step")
+def api_step(req: _StepReq):
+    from adaptive_nav.models import NavAction
+    env = _get_env()
+    obs = env.step(NavAction(action_id=req.action_id))
+    return obs.model_dump()
+
+
+# ---------------------------------------------------------------------------
 # Routes that are always available regardless of OpenEnv status
 # ---------------------------------------------------------------------------
 

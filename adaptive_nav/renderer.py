@@ -19,7 +19,17 @@ CELL_COLORS: dict[str, tuple[int, int, int]] = {
 _DEFAULT_COLOR = (180, 180, 180)
 _PATH_HINT_COLOR = (140, 200, 255)  # light blue dot for path hints
 
-LEGEND = "A=agent  K=key  D=door  G=goal  #=wall  .=empty  X=hazard"
+LEGEND = """Adaptive Nav Environment — Legend
+
+  G (green)   — Goal: your objective; reach this to win
+  A (blue)    — Agent: the player you control
+  K (gold)    — Key: collect this to unlock the door
+  D (brown)   — Door: locked until you have the key
+  # (grey)    — Wall: impassable obstacle
+  . (white)   — Empty: walkable floor
+  X (red)     — Hazard: avoid; costs energy or harms
+
+  In debug mode: light blue dots mark path hints."""
 
 
 # ---------------------------------------------------------------------------

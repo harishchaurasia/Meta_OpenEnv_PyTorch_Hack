@@ -106,17 +106,92 @@ def obs_to_prompt(obs: Any) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Multiple-choice action scoring
+# Action masking from the local observation window
 # ──────────────────────────────────────────────────────────────────────────────
 
-def score_actions(prompt: str, tokenizer, model) -> list[float]:
+# Grid symbols (must match adaptive_nav.generator)
+_WALL = "#"
+_KEY = "K"
+_DOOR = "D"
+
+# Movement deltas indexed by action id: up=0, down=1, left=2, right=3
+_MOVE_DR_DC = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+
+def compute_action_mask(obs: Any) -> tuple[list[bool], list[str]]:
+    """Inspect the local view and decide which actions are clearly useless.
+
+    Returns ``(mask, reasons)`` where ``mask[i]`` is True when action *i* is
+    allowed.  ``reasons`` collects human-readable strings for masked actions.
+    """
+    local_view = _get(obs, "local_view", [])
+    has_key = _get(obs, "has_key", False)
+
+    # Convert to plain list-of-lists if numpy
+    if hasattr(local_view, "tolist"):
+        local_view = local_view.tolist()
+
+    rows = len(local_view)
+    cols = len(local_view[0]) if rows else 0
+    cr, cc = rows // 2, cols // 2  # agent is always at the center
+
+    mask = [True] * 6
+    reasons: list[str] = []
+
+    # -- Mask movement into walls ------------------------------------------
+    for action_id, (dr, dc) in enumerate(_MOVE_DR_DC):
+        nr, nc = cr + dr, cc + dc
+        if 0 <= nr < rows and 0 <= nc < cols:
+            cell = str(local_view[nr][nc])
+            if cell == _WALL:
+                mask[action_id] = False
+                reasons.append(f"{ACTION_WORDS[action_id]}→wall")
+        else:
+            # Out of the view window means out-of-bounds wall
+            mask[action_id] = False
+            reasons.append(f"{ACTION_WORDS[action_id]}→edge")
+
+    # -- Mask interact unless it would actually do something -----------------
+    agent_cell = str(local_view[cr][cc]) if rows and cols else ""
+    standing_on_key = agent_cell == _KEY
+    door_unlocked = bool(_get(obs, "door_unlocked", False))
+
+    door_adjacent = False
+    for dr, dc in _MOVE_DR_DC:
+        nr, nc = cr + dr, cc + dc
+        if 0 <= nr < rows and 0 <= nc < cols:
+            if str(local_view[nr][nc]) == _DOOR:
+                door_adjacent = True
+                break
+
+    can_interact = standing_on_key or (door_adjacent and has_key and not door_unlocked)
+
+    if not can_interact:
+        mask[4] = False
+        if door_adjacent and not has_key:
+            reasons.append("interact→door but no key")
+        elif door_adjacent and door_unlocked:
+            reasons.append("interact→door already open")
+        else:
+            reasons.append("interact→nothing nearby")
+
+    # -- wait is always valid (index 5) ------------------------------------
+    # (already True)
+
+    return mask, reasons
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Multiple-choice action scoring (with masking)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_NEG_INF = float("-inf")
+
+
+def score_actions(prompt: str, tokenizer, model, mask: list[bool]) -> list[float]:
     """Score each candidate action by its log-probability under the model.
 
-    For each action word we concatenate ``prompt + " " + word``, run a single
-    forward pass, and sum the log-probs of the action-word tokens.  This is
-    the standard "completion scoring" trick for multiple-choice with causal LMs.
-
-    Returns a list of 6 floats (one score per action).
+    Masked actions (``mask[i] == False``) get ``-inf`` and are never chosen.
     """
     import torch
     import torch.nn.functional as F
@@ -127,22 +202,24 @@ def score_actions(prompt: str, tokenizer, model) -> list[float]:
     device = next(model.parameters()).device
 
     scores: list[float] = []
-    for word in ACTION_WORDS:
+    for idx, word in enumerate(ACTION_WORDS):
+        if not mask[idx]:
+            scores.append(_NEG_INF)
+            continue
+
         full_text = f"{prompt} {word}"
         full_ids = tokenizer(full_text, return_tensors="pt", truncation=True,
                              max_length=1024 + 8)["input_ids"].to(device)
-        # Number of tokens belonging to " <word>"
         action_len = full_ids.shape[1] - prompt_len
         if action_len <= 0:
-            scores.append(float("-inf"))
+            scores.append(_NEG_INF)
             continue
 
         with torch.no_grad():
             logits = model(full_ids).logits  # (1, seq_len, vocab)
 
-        # Log-probs of each token in the action suffix
-        # logits[:, t, :] predicts token t+1, so we look at positions
-        # [prompt_len-1 .. -2] to score tokens [prompt_len .. -1].
+        # logits[:, t, :] predicts token t+1, so positions
+        # [prompt_len-1 .. -2] score tokens [prompt_len .. -1].
         log_probs = F.log_softmax(logits[0, prompt_len - 1: -1, :], dim=-1)
         target_ids = full_ids[0, prompt_len:]
         token_scores = log_probs[range(action_len), target_ids]
@@ -151,14 +228,27 @@ def score_actions(prompt: str, tokenizer, model) -> list[float]:
     return scores
 
 
-def choose_action(prompt: str, tokenizer, model) -> tuple[int, str, list[float]]:
-    """Pick the best action via log-prob scoring.
+def choose_action(
+    prompt: str,
+    obs: Any,
+    tokenizer,
+    model,
+) -> tuple[int, str, list[float], list[bool], list[str]]:
+    """Pick the best unmasked action via log-prob scoring.
 
-    Returns (action_id, action_word, all_scores).
+    Returns (action_id, action_word, scores, mask, mask_reasons).
     """
-    scores = score_actions(prompt, tokenizer, model)
-    best = int(max(range(len(scores)), key=lambda i: scores[i]))
-    return best, ACTION_WORDS[best], scores
+    mask, reasons = compute_action_mask(obs)
+    scores = score_actions(prompt, tokenizer, model, mask)
+
+    # Pick the highest-scoring *allowed* action (fallback: wait)
+    best = 5
+    best_score = _NEG_INF
+    for i, s in enumerate(scores):
+        if mask[i] and s > best_score:
+            best, best_score = i, s
+
+    return best, ACTION_WORDS[best], scores, mask, reasons
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -181,21 +271,40 @@ class LocalEnvAdapter:
 
 
 class RemoteEnvAdapter:
+    """Plain HTTP adapter for the deployed OpenEnv server.
+
+    Uses the REST endpoints (/api/reset, /api/step) instead of WebSocket.
+    HF Spaces aggressively closes idle WebSocket sessions, so HTTP is far
+    more reliable for hackathon use.
+    """
+
     def __init__(self, base_url: str):
-        from adaptive_nav.models import NavAction
-        from adaptive_nav.openenv_client import NavEnvClient
-        self.NavAction = NavAction
-        self.client = NavEnvClient(base_url=base_url)
+        import json
+        import urllib.request
+        self._json = json
+        self._urlopen = urllib.request.urlopen
+        self._Request = urllib.request.Request
+        self._base = base_url.rstrip("/")
+
+    def _post(self, path: str, body: dict) -> dict:
+        data = self._json.dumps(body).encode()
+        req = self._Request(
+            f"{self._base}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = self._urlopen(req, timeout=30)
+        return self._json.loads(resp.read())
 
     def reset(self, seed: int | None = None):
-        result = self.client.reset()
-        return result.observation if hasattr(result, "observation") else result
+        return self._post("/api/reset", {"seed": seed})
 
     def step(self, action_id: int):
-        result = self.client.step(self.NavAction(action_id=action_id))
-        obs = result.observation if hasattr(result, "observation") else result
-        reward = float(getattr(result, "reward", 0.0) or 0.0)
-        done = bool(getattr(result, "done", False))
+        result = self._post("/api/step", {"action_id": action_id})
+        obs = result
+        reward = float(result.get("reward", 0.0) or 0.0)
+        done = bool(result.get("done", False))
         return obs, reward, done, {}
 
 
@@ -217,7 +326,7 @@ def run_episode(
     seed: int | None = None,
     verbose: bool = False,
 ) -> tuple[float, list[str], list[int]]:
-    """Play up to *max_steps* using log-prob action scoring each turn.
+    """Play up to *max_steps* using masked log-prob action scoring each turn.
 
     Returns (total_reward, chosen_action_words, action_ids).
     """
@@ -228,12 +337,20 @@ def run_episode(
 
     for t in range(max_steps):
         prompt = obs_to_prompt(obs)
-        action_id, word, scores = choose_action(prompt, tokenizer, model)
+        action_id, word, scores, mask, mask_reasons = choose_action(
+            prompt, obs, tokenizer, model,
+        )
 
         if verbose:
-            ranked = sorted(zip(ACTION_WORDS, scores), key=lambda x: x[1], reverse=True)
-            top3 = " | ".join(f"{w}={s:+.2f}" for w, s in ranked[:3])
-            print(f"  step {t}: chose {word:>8s}  ({top3})")
+            # Show allowed actions with scores, then which ones were masked
+            allowed = [
+                (ACTION_WORDS[i], scores[i])
+                for i in range(6) if mask[i]
+            ]
+            allowed.sort(key=lambda x: x[1], reverse=True)
+            top = " | ".join(f"{w}={s:+.2f}" for w, s in allowed[:4])
+            masked_str = ", ".join(mask_reasons) if mask_reasons else "none"
+            print(f"  step {t}: chose {word:>8s}  ({top})  masked=[{masked_str}]")
 
         words.append(word)
         ids.append(action_id)

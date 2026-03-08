@@ -158,5 +158,5 @@ with col_obs:
 # ---------------------------------------------------------------------------
 # Legend
 # ---------------------------------------------------------------------------
-with st.expander("Legend"):
-    st.code(LEGEND, language=None)
+with st.expander("Legend (colors & map elements)"):
+    st.text(LEGEND)
