@@ -1,47 +1,166 @@
 #!/usr/bin/env python3
-"""Minimal TRL + OpenEnv training skeleton for the Adaptive Navigation Environment.
+"""TRL training skeleton for the Adaptive Navigation Environment.
 
-This is a **scaffold only** -- it shows where each piece plugs in so you can
-iterate quickly during the hackathon.  It is NOT expected to converge on a
-good policy; the goal is to demonstrate the integration wiring.
+Demonstrates how to wire a grid-world OpenEnv environment into
+Hugging Face TRL's GRPOTrainer.  Designed for easy Colab execution
+on a single GPU -- no vLLM required.
 
-Requirements (install in a Colab / GPU notebook):
-    pip install trl transformers datasets accelerate
-    pip install openenv-core[core]>=0.2.1
-    pip install -e .            # installs adaptive_nav from this repo
+This is a hackathon scaffold.  It won't converge to a strong policy,
+but it shows the full loop: observation -> prompt -> LLM -> parse action
+-> step environment -> accumulate reward -> train.
 
-Usage:
-    # 1. Start the OpenEnv server (in another terminal or Docker):
-    #    uvicorn adaptive_nav.server.app:app --host 0.0.0.0 --port 8001
-    #
-    # 2. Run training (colocate mode, 1 GPU):
-    #    python train_skeleton.py
-
-    # Or connect to a remote HF Space:
-    #    python train_skeleton.py --env-url https://YOUR-SPACE.hf.space
+Colab quick-start:
+    !pip install trl transformers datasets accelerate pydantic numpy
+    !git clone https://github.com/harishchaurasia/Meta_OpenEnv_PyTorch_Hack.git
+    %cd Meta_OpenEnv_PyTorch_Hack
+    !python train_skeleton.py --episodes 16
 """
 
 from __future__ import annotations
 
 import argparse
+import random
+import re
 
-# ---------------------------------------------------------------------------
-# This skeleton imports TRL / Datasets lazily so the file can be read (and
-# linted) even when those heavy libraries are not installed locally.
-# ---------------------------------------------------------------------------
 
+# ── CLI ──────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TRL training skeleton for Adaptive Nav")
-    p.add_argument("--env-url", type=str, default="http://localhost:8001",
-                    help="Base URL of the running OpenEnv server")
-    p.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct",
-                    help="HF model id")
+    p.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    p.add_argument("--episodes", type=int, default=32,
+                   help="Number of prompt episodes in the dataset")
+    p.add_argument("--rollout-steps", type=int, default=8,
+                   help="Steps per mini-episode during rollout")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--max-completion-length", type=int, default=512)
+    p.add_argument("--max-completion-length", type=int, default=32,
+                   help="Max tokens the model can generate per turn")
+    p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
+
+# ── Observation → text prompt ────────────────────────────────────────────
+
+SYSTEM_PROMPT = """\
+You are an agent in a 2D grid maze.  Your mission:
+  1. Find the key (K)
+  2. Unlock the door (D)
+  3. Reach the goal (G)
+
+You can only see a small window around you.
+Respond with EXACTLY ONE digit 0-5:
+  0=up  1=down  2=left  3=right  4=interact  5=wait
+No other text."""
+
+
+def obs_to_prompt(obs) -> str:
+    """Build a natural-language prompt from a NavObservation.
+
+    The prompt gives the LLM everything the agent can see so it can
+    reason about which action to take next.
+    """
+    # Format the local view as a readable grid
+    if hasattr(obs, "local_view"):
+        view = obs.local_view
+    else:
+        view = obs["local_view"]
+
+    grid_lines = "\n".join(" ".join(row) for row in view)
+
+    if hasattr(obs, "energy"):
+        energy = obs.energy
+        has_key = obs.has_key
+        door_unlocked = obs.door_unlocked
+        step_count = obs.step_count
+        mission = obs.mission if hasattr(obs, "mission") else {}
+    else:
+        energy = obs["energy"]
+        has_key = obs["has_key"]
+        door_unlocked = obs["door_unlocked"]
+        step_count = obs["step_count"]
+        mission = obs.get("mission", {})
+
+    m = mission
+    mission_str = (
+        f"  get_key: {'DONE' if m.get('get_key') else 'TODO'}\n"
+        f"  unlock_door: {'DONE' if m.get('unlock_door') else 'TODO'}\n"
+        f"  reach_goal: {'DONE' if m.get('reach_goal') else 'TODO'}"
+    )
+
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"--- Current observation ---\n"
+        f"Local view:\n{grid_lines}\n\n"
+        f"Energy: {energy}\n"
+        f"Has key: {has_key}\n"
+        f"Door unlocked: {door_unlocked}\n"
+        f"Step: {step_count}\n"
+        f"Mission:\n{mission_str}\n\n"
+        f"Your action (single digit 0-5):"
+    )
+
+
+# ── Parse model output ──────────────────────────────────────────────────
+
+_ACTION_RE = re.compile(r"[0-5]")
+
+
+def parse_action(text: str) -> int:
+    """Extract the first valid action digit from model output.
+
+    Returns 5 (wait) if nothing valid is found -- safe no-op.
+    """
+    m = _ACTION_RE.search(text.strip())
+    return int(m.group()) if m else 5
+
+
+# ── Mini-episode rollout ────────────────────────────────────────────────
+
+def run_episode(env, tokenizer, model, max_steps: int, max_tokens: int) -> tuple[float, list[str]]:
+    """Play a short episode: observe → generate → parse → step → repeat.
+
+    Returns (total_reward, list_of_completions).
+    Uses the local AdaptiveNavEnv directly -- no server needed.
+    """
+    import torch
+
+    obs = env.reset(seed=random.randint(0, 99999))
+    total_reward = 0.0
+    completions: list[str] = []
+
+    for _ in range(max_steps):
+        prompt = obs_to_prompt(obs)
+
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            )
+
+        # Decode only the generated tokens (not the prompt)
+        new_tokens = output_ids[0, inputs["input_ids"].shape[1]:]
+        completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        completions.append(completion)
+
+        action_id = parse_action(completion)
+        obs, reward, done, _info = env.step(action_id)
+        total_reward += reward
+
+        if done:
+            break
+
+    return total_reward, completions
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
     args = parse_args()
@@ -50,91 +169,97 @@ def main() -> None:
     try:
         from datasets import Dataset
         from trl import GRPOConfig, GRPOTrainer
-        from trl.experimental.openenv import generate_rollout_completions
     except ImportError as exc:
         raise SystemExit(
             "Training requires:  pip install trl transformers datasets accelerate\n"
             f"Missing: {exc.name}"
         ) from exc
 
-    from adaptive_nav.models import NavAction
-    from adaptive_nav.openenv_client import NavEnvClient
+    from adaptive_nav.env import AdaptiveNavEnv
 
-    # -- connect to the OpenEnv server -------------------------------------
-    client = NavEnvClient(base_url=args.env_url)
+    # -- build prompt dataset from real environment observations -----------
+    # Each row is a prompt built from a fresh episode's initial observation.
+    env = AdaptiveNavEnv(grid_size=10, max_energy=50, dynamic_changes=True)
+    prompts: list[str] = []
+    for i in range(args.episodes):
+        obs = env.reset(seed=args.seed + i)
+        prompts.append(obs_to_prompt(obs))
 
-    # -- build a toy prompt dataset ----------------------------------------
-    SYSTEM_PROMPT = (
-        "You are an agent navigating a grid maze. "
-        "Respond with a single action id (0-5): "
-        "0=up 1=down 2=left 3=right 4=interact 5=wait."
-    )
-    dataset = Dataset.from_dict({
-        "prompt": [SYSTEM_PROMPT] * 32,
-    })
+    dataset = Dataset.from_dict({"prompt": prompts})
+    print(f"Dataset: {len(dataset)} episodes, first prompt length: {len(prompts[0])} chars")
 
-    # -- custom rollout function -------------------------------------------
-    def rollout_func(prompts: list[str], trainer: GRPOTrainer):
-        """Generate completions, step through the env, collect rewards."""
-        outputs = generate_rollout_completions(trainer, prompts)
+    # -- custom rollout: multi-step episode per prompt ---------------------
+    def rollout_func(prompts_batch: list[str], trainer: GRPOTrainer):
+        """For each prompt, run a short episode and return accumulated reward."""
+        from transformers import AutoModelForCausalLM
         tokenizer = trainer.processing_class
-        completions_text = [
-            tokenizer.decode(o["completion_ids"], skip_special_tokens=True)
-            for o in outputs
-        ]
+        model = trainer.model
 
-        # Step through the environment for each completion
-        env_rewards: list[float] = []
-        for text in completions_text:
-            client.reset()
-            # Parse the model's output as an action id (best-effort)
-            action_id = _parse_action(text)
-            result = client.step(NavAction(action_id=action_id))
-            env_rewards.append(float(result.reward or 0.0))
+        all_prompt_ids = []
+        all_completion_ids = []
+        all_logprobs = []
+        all_rewards = []
+
+        for prompt_text in prompts_batch:
+            # Tokenize the prompt
+            prompt_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"][0]
+
+            # Run a mini-episode against the local environment
+            ep_env = AdaptiveNavEnv(grid_size=10, max_energy=50, dynamic_changes=True)
+            ep_reward, completions = run_episode(
+                ep_env, tokenizer, model,
+                max_steps=args.rollout_steps,
+                max_tokens=args.max_completion_length,
+            )
+
+            # Use the concatenated completions as the "completion" for training
+            full_completion = " ".join(completions)
+            completion_ids = tokenizer(
+                full_completion, return_tensors="pt", truncation=True,
+                max_length=args.max_completion_length,
+            )["input_ids"][0]
+
+            all_prompt_ids.append(prompt_ids)
+            all_completion_ids.append(completion_ids)
+            # Placeholder logprobs (GRPOTrainer recomputes these internally)
+            all_logprobs.append([0.0] * len(completion_ids))
+            all_rewards.append(ep_reward)
 
         return {
-            "prompt_ids": [o["prompt_ids"] for o in outputs],
-            "completion_ids": [o["completion_ids"] for o in outputs],
-            "logprobs": [o["logprobs"] for o in outputs],
-            "env_reward": env_rewards,
+            "prompt_ids": all_prompt_ids,
+            "completion_ids": all_completion_ids,
+            "logprobs": all_logprobs,
+            "env_reward": all_rewards,
         }
 
-    # -- reward function that reads env_reward from kwargs -----------------
+    # -- reward function ---------------------------------------------------
     def reward_from_env(completions, **kwargs):
+        """Pass through environment rewards collected during rollout."""
         rewards = kwargs.get("env_reward", [])
         return [float(r) for r in rewards] if rewards else [0.0] * len(completions)
 
-    # -- trainer setup -----------------------------------------------------
+    # -- trainer -----------------------------------------------------------
+    # No vLLM -- plain PyTorch generation for maximum Colab compatibility.
     trainer = GRPOTrainer(
         model=args.model,
         reward_funcs=reward_from_env,
         train_dataset=dataset,
         rollout_func=rollout_func,
         args=GRPOConfig(
-            use_vllm=True,
-            vllm_mode="colocate",
+            use_vllm=False,
             num_train_epochs=args.epochs,
-            num_generations=4,
+            num_generations=2,
             max_completion_length=args.max_completion_length,
             per_device_train_batch_size=args.batch_size,
             gradient_accumulation_steps=2,
+            logging_steps=1,
+            output_dir="./nav_training_output",
         ),
     )
+
+    print("Starting training...")
     trainer.train()
     print("Training complete.")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _parse_action(text: str) -> int:
-    """Best-effort parse of a model completion into an action id 0-5."""
-    text = text.strip()
-    for ch in text:
-        if ch.isdigit() and 0 <= int(ch) <= 5:
-            return int(ch)
-    return 5  # default to wait
 
 
 if __name__ == "__main__":
