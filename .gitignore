@@ -6,3 +6,4 @@ dist/
 build/
 .DS_Store
 .zsh_history
+nav_training_output/
